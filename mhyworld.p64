@@ -27,7 +27,7 @@ function BlockMesh.add_face(st, face, ox, oy, oz, ax, ay)
   R.st_fan(st, {p(1), p(3), p(4)}, {a, c, d})
 end
 :: main.lua
---[[pod_format="raw",created="2026-11-25 03:15:49",modified="2026-11-25 17:24:32",revision=8]]
+--[[pod_format="raw",created="2026-11-25 03:15:49",modified="2026-11-25 17:48:07",revision=13]]
 -- main.lua
 include("terrain.lua")
 include("render3d.lua")
@@ -36,19 +36,30 @@ include("player.lua")
 
 local SX, SY, SZ = 16, 16, 16      -- Global.CHUNK_SIZE
 local SEED = 128
-ATLAS_W, ATLAS_H = 1, 1            -- Global.TEXTURE_ATLAS_SIZE (placeholder: gfx/0.gfx is one tile)
+ATLAS_W, ATLAS_H = 1, 1
 local terrain
-local blocks, mesh = {}, {}
 local cx, cy, cz = 0, 0, 0
-local gen_time = 0
+local cur, gen_time = nil, 0
 
 local function block_index(x, y, z) return (y * SZ + z) * SX + x + 1 end
 
+--#region chunk map (world.gd: _chunk_map / lookup_chunk, Global.wrap_chunk)
+local chunk_map = {}
+local NEIGHBOR_DIRS = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
+
+local function chunk_key(x, y, z)
+  local n = world_size \ SX
+  return (x % n) .. "," .. y .. "," .. (z % n)
+end
+
+local function lookup_chunk(x, y, z) return chunk_map[chunk_key(x, y, z)] end
+--#endregion
+
 -- port of Chunk._generate
-local function generate()
+local function generate(c)
   local t0 = time()
-  local ox, oy, oz = cx * SX, cy * SY, cz * SZ
-  blocks = {}
+  local ox, oy, oz = c.x * SX, c.y * SY, c.z * SZ
+  local blocks = {}
   for x = 0, SX - 1 do
     for z = 0, SZ - 1 do
       local h, biome = terrain:sample_column(ox + x, oz + z)
@@ -57,18 +68,45 @@ local function generate()
       end
     end
   end
+  c.blocks, c.generated = blocks, true
   gen_time = (time() - t0) * 1000
 end
 
--- port of Chunk._is_transparent (outside the chunk: ask the noise, like the fallback)
-local function is_transparent(x, y, z)
-  if x < 0 or x >= SX or y < 0 or y >= SY or z < 0 or z >= SZ then
-    return not terrain:is_solid(cx * SX + x, cy * SY + y, cz * SZ + z)
+-- stand-in for World streaming: make the chunk if nobody has yet
+local function get_chunk(x, y, z)
+  local c = lookup_chunk(x, y, z)
+  if not c then
+    c = {x = x, y = y, z = z}
+    chunk_map[chunk_key(x, y, z)] = c
+    generate(c)
   end
-  return blocks[block_index(x, y, z)] == 0
+  return c
 end
 
--- face, neighbour direction (same order as Chunk._create_block)
+-- port of Chunk._snapshot_neighbors
+local function snapshot_neighbors(c)
+  c.snaps = {}
+  for d in all(NEIGHBOR_DIRS) do
+    local n = lookup_chunk(c.x + d[1], c.y + d[2], c.z + d[3])
+    if n and n ~= c and n.generated then
+      c.snaps[d[1] .. "," .. d[2] .. "," .. d[3]] = n.blocks
+    end
+  end
+end
+
+-- port of Chunk._is_transparent
+local function is_transparent(c, x, y, z)
+  if x < 0 or x >= SX or y < 0 or y >= SY or z < 0 or z >= SZ then
+    local dx = x < 0 and -1 or (x >= SX and 1 or 0)
+    local dy = y < 0 and -1 or (y >= SY and 1 or 0)
+    local dz = z < 0 and -1 or (z >= SZ and 1 or 0)
+    local ns = c.snaps[dx .. "," .. dy .. "," .. dz]
+    if ns then return ns[block_index(x % SX, y % SY, z % SZ)] == 0 end
+    return not terrain:is_solid(c.x * SX + x, c.y * SY + y, c.z * SZ + z)
+  end
+  return c.blocks[block_index(x, y, z)] == 0
+end
+
 local FACES = {
   {BlockMesh.TOP,    0, 1, 0}, {BlockMesh.BOTTOM, 0,-1, 0},
   {BlockMesh.NORTH,  0, 0, 1}, {BlockMesh.SOUTH,  0, 0,-1},
@@ -76,63 +114,68 @@ local FACES = {
 }
 
 -- port of Chunk._update_mesh / _create_block
-local function build_mesh()
+local function build_mesh(c)
+  snapshot_neighbors(c)
   local st = R.st_begin()
   for y = 0, SY - 1 do
     for z = 0, SZ - 1 do
       for x = 0, SX - 1 do
-        if blocks[block_index(x, y, z)] ~= 0 then
+        if c.blocks[block_index(x, y, z)] ~= 0 then
           for f in all(FACES) do
-            if is_transparent(x + f[2], y + f[3], z + f[4]) then
-              BlockMesh.add_face(st, f[1], x, y, z, 0, 0) -- atlas tile (0,0) for every block for now
+            if is_transparent(c, x + f[2], y + f[3], z + f[4]) then
+              BlockMesh.add_face(st, f[1], x, y, z, 0, 0)
             end
           end
         end
       end
     end
   end
-  mesh = st
+  c.mesh = st
+end
+
+-- make sure the 6 neighbours exist (World's job), then mesh this chunk
+local function show_chunk()
+  cur = get_chunk(cx, cy, cz)
+  for d in all(NEIGHBOR_DIRS) do get_chunk(cx + d[1], cy + d[2], cz + d[3]) end
+  if not cur.mesh then build_mesh(cur) end
 end
 
 function _init()
-  R.tex = get_spr(0)
+  R.tex = get_spr(1)
   terrain = TerrainGenerator.for_seed(SEED)
   player = Player.new(terrain)
   cx, cy, cz = flr(player.x / SX), flr(player.y / SY), flr(player.z / SZ)
-  generate() build_mesh()
+  show_chunk()
 end
 
 function _update()
   local _, _, mb = mouse()
   if mb & 1 > 0 then mouselock(true) end
   player:look(mouselock())
-  if keyp("n") then player:toggle_noclip() end -- Godot's "noclip" console command
+  if keyp("n") then player:toggle_noclip() end
 
   player:update(1 / 60)
 
-  -- no chunk streaming yet: just show the chunk the player is standing in
   local nx, ny, nz = flr(player.x / SX), flr(player.y / SY), flr(player.z / SZ)
   if nx ~= cx or ny ~= cy or nz ~= cz then
     cx, cy, cz = nx, ny, nz
-    generate() build_mesh()
+    show_chunk()
   end
 end
 
 function _draw()
   cls(12)
-  -- orbit camera around the chunk centre, looking at it
   player:camera(R.cam)
 
   local t0 = stat(1)
-  R.draw_mesh(mesh, cx * SX, cy * SY, cz * SZ)
+  R.draw_mesh(cur.mesh, cx * SX, cy * SY, cz * SZ)
   local t1 = stat(1)
   R.flush()
   local t2 = stat(1)
 
   print("fps: " .. stat(7), 2, 2, 7)
   print(string.format("proj %.2f  flush %.2f", t1 - t0, t2 - t1), 2, 22, 7)
-  print(string.format("chunk %d,%d,%d  gen %.1f ms  tris %d", cx, cy, cz, gen_time, #mesh), 2, 12, 7)
-  print("arrows: orbit  wasd: x/z  z/x: y", 2, 260, 6)
+  print(string.format("chunk %d,%d,%d  gen %.1f ms  tris %d", cx, cy, cz, gen_time, #cur.mesh), 2, 12, 7)
 end
 :: player.lua
 --[[pod_format="raw",created="2026-11-25 17:19:54",modified="2026-11-25 17:25:33",revision=1]]
@@ -264,7 +307,7 @@ function Player:camera(c)
   c.yaw, c.pitch = self.yaw, self.pitch
 end
 :: render3d.lua
---[[pod_format="raw",created="2026-11-25 03:19:31",modified="2026-11-25 04:22:08",revision=7]]
+--[[pod_format="raw",created="2026-11-25 03:19:31",modified="2026-11-25 17:47:05",revision=9]]
 -- render3d.lua : minimal PSX-style software renderer for Picotron
 -- Affine textures (like models.gdshader with affine_weight=1), vertex snapping, painter's sort.
 
@@ -278,6 +321,8 @@ R = {
   tex = nil,               -- atlas userdata
   list = {},               -- triangles queued this frame
 }
+
+R.fog_start, R.fog_end, R.fog_col = 20, 40, 12  -- col = the cls() sky colour
 
 ---------------------------------------------------------------- SurfaceTool
 -- st = R.st_begin()
@@ -338,7 +383,7 @@ function R.draw_mesh(mesh, ox, oy, oz)
 end
 
 -- Rasterise one triangle with a tline3d per scanline (w=1 -> affine).
-local function raster(a, b, c)
+local function raster(a, b, c, fog)
   if a.y > b.y then a, b = b, a end
   if b.y > c.y then b, c = c, b end
   if a.y > b.y then a, b = b, a end
@@ -361,17 +406,25 @@ local function raster(a, b, c)
         local xs, us, vs = p.x + dx*f, p.u + du*f, p.v + dv*f
         local xl, ul, vl = a.x + dlx*g, a.u + dlu*g, a.v + dlv*g
         for y = y0, y1 do
-          if xl < xs then
-            tline3d(tex, xl, y, xs, y, ul, vl, us, vs, 1, 1)
-          else
-            tline3d(tex, xs, y, xl, y, us, vs, ul, vl, 1, 1)
+          if fog < 2 then
+            if xl < xs then
+              tline3d(tex, xl, y, xs, y, ul, vl, us, vs, 1, 1)
+            else
+              tline3d(tex, xs, y, xl, y, us, vs, ul, vl, 1, 1)
+            end
           end
+          if fog == 2 or (fog == 1 and y % 2 == 0) then line(xl, y, xs, y, R.fog_col) end
           xs += dx us += du vs += dv
           xl += dlx ul += dlu vl += dlv
         end
       end
     end
   end
+end
+
+local function fog_level(z)
+  local f = mid(0, (z / 3 - R.fog_start) / (R.fog_end - R.fog_start), 1)
+  return min(flr(f * 3), 2)  -- 0 clear, 1 striped, 2 solid fog
 end
 
 -- Far to near, then clear the queue.
@@ -386,7 +439,7 @@ function R.flush()
   end
   for i = N, 1, -1 do          -- far to near
     local b = buckets[i]
-    if b then for t in all(b) do raster(t[1], t[2], t[3]) end end
+    for t in all(b) do raster(t[1], t[2], t[3], fog_level(t.z)) end
   end
   R.list = {}
 end
@@ -602,23 +655,23 @@ function TerrainGenerator:is_solid(gx, gy, gz)
 end
 --#endregion
 :: .info.pod
---[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 17:25:33",runtime=26,workspaces={{location="main.lua#22",workspace_index=1},{location="terrain.lua#34",workspace_index=1},{location="render3d.lua#63",workspace_index=1},{location="block_mesh.lua#10",workspace_index=1},{location="player.lua#67",workspace_index=1},{location="gfx/0.gfx#1",workspace_index=2},{location="map/0.map",workspace_index=3},{location="sfx/0.sfx",workspace_index=4}}]]
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 17:48:07",runtime=26,workspaces={{location="main.lua#114",workspace_index=1},{location="terrain.lua#34",workspace_index=1},{location="render3d.lua#130",workspace_index=1},{location="block_mesh.lua#10",workspace_index=1},{location="player.lua#67",workspace_index=1},{location="gfx/0.gfx#1",workspace_index=2},{location="map/0.map",workspace_index=3},{location="sfx/0.sfx",workspace_index=4}}]]
 :: gfx/.info.pod
---[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 17:25:33"]]
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 17:48:07"]]
 :: gfx/0.gfx
 b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNi0x
 MS0yNSAxNzoyMzowNiIscmV2aXNpb249NV1dbHo0AIQAAAAlMQAA_Ah7WzBdPXtibXA9cHh1AEMg
 EBAEfx5wfgIASfAAfnACAOMsZmxhZ3M9MCxwYW5feAgAynk9MCx6b29tPTh9LFAAP-8b8DIAHB-w
 MQD---------------------------------------------------------------_nUG09OH19
 :: map/.info.pod
---[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 17:25:33"]]
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 17:48:07"]]
 :: map/0.map
 b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNi0x
-MS0yNSAwMjo1NToyOSIscmV2aXNpb249Ml1dbHo0AEwAAABQAAAA8Rx7e2JtcD1weHUATIAgIAD-
+MS0yNSAxNzoyNzo1NSIscmV2aXNpb249NF1dbHo0AEwAAABQAAAA8Rx7e2JtcD1weHUATIAgIAD-
 AAD---8DLGhpZGRlbj1mYWxzZSxwYW5feD0wCADSeT0wLHRpbGVfaD0xNgoAEHcKAIB6b29tPTF9
 fQ==
 :: sfx/.info.pod
---[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 17:25:33"]]
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 17:48:07"]]
 :: sfx/0.sfx
 b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTMxIDA4OjMwOjI4Iixtb2RpZmllZD0iMjAyNi0x
 MS0yNSAwNDowMzozNSIscmV2aXNpb249MV1dbHo0AKUAAAALCgAA-zBweHUAAygAAAQABA9AEAIO
