@@ -1,0 +1,334 @@
+picotron cartridge // www.picotron.net
+version 2
+
+:: gfx/
+:: map/
+:: sfx/
+:: block_mesh.lua
+--[[pod_format="raw",created="2026-11-25 03:19:49",modified="2026-11-25 03:19:49",revision=0]]
+-- block_mesh.lua  (port of block_mesh.gd)
+BlockMesh = {}
+local V = {
+  {0,0,0},{1,0,0},{0,1,0},{1,1,0},{0,0,1},{1,0,1},{0,1,1},{1,1,1},
+}
+BlockMesh.TOP    = {3,4,8,7}   -- Lua is 1-based: Godot indices + 1
+BlockMesh.BOTTOM = {1,5,6,2}
+BlockMesh.NORTH  = {8,6,5,7}
+BlockMesh.SOUTH  = {3,1,2,4}
+BlockMesh.EAST   = {4,2,6,8}
+BlockMesh.WEST   = {7,5,1,3}
+
+function BlockMesh.add_face(st, face, ox, oy, oz, ax, ay)
+  local function p(i) local v = V[face[i]]; return {v[1]+ox, v[2]+oy, v[3]+oz} end
+  local t = {1 / ATLAS_W, 1 / ATLAS_H}          -- Global.TEXTURE_ATLAS_SIZE
+  local u, v = ax * t[1], ay * t[2]
+  local a, b, c, d = {u, v}, {u, v+t[2]}, {u+t[1], v+t[2]}, {u+t[1], v}
+  R.st_fan(st, {p(1), p(2), p(3)}, {a, b, c})
+  R.st_fan(st, {p(1), p(3), p(4)}, {a, c, d})
+end
+:: main.lua
+--[[pod_format="raw",created="2026-11-25 03:15:49",modified="2026-11-25 03:19:21",revision=1]]
+
+:: render3d.lua
+--[[pod_format="raw",created="2026-11-25 03:19:31",modified="2026-11-25 03:19:31",revision=0]]
+-- render3d.lua : minimal PSX-style software renderer for Picotron
+-- Affine textures (like models.gdshader with affine_weight=1), vertex snapping, painter's sort.
+
+R = {
+  cx = 240, cy = 135,      -- screen centre (480x270)
+  focal = 200,             -- pixels; bigger = narrower fov
+  near = 0.1,
+  snap = 1,                -- 1 = snap to whole pixels (PSX wobble), 0 = off
+  cull = 1,                -- flip to -1 if everything vanishes
+  cam = {x=0, y=0, z=0, yaw=0, pitch=0},
+  tex = nil,               -- atlas userdata
+  list = {},               -- triangles queued this frame
+}
+
+---------------------------------------------------------------- SurfaceTool
+-- st = R.st_begin()
+-- R.st_fan(st, {a,b,c}, {uva,uvb,uvc})   -- same as add_triangle_fan, verts are {x,y,z}, uvs {u,v} 0..1
+-- mesh = st   (a mesh is just the list of triangles)
+function R.st_begin() return {} end
+
+function R.st_fan(st, v, uv)
+  for i = 2, #v - 1 do
+    add(st, {v[1], v[i], v[i+1], uv[1], uv[i], uv[i+1]})
+  end
+end
+
+---------------------------------------------------------------- Drawing
+-- Queue a mesh at a world offset (a chunk's position).
+function R.draw_mesh(mesh, ox, oy, oz)
+  local c = R.cam
+  local cy, sy = cos(c.yaw), sin(c.yaw)
+  local cp, sp = cos(c.pitch), sin(c.pitch)
+  local tw, th = R.tex:width(), R.tex:height()
+
+  -- world -> view -> screen
+  local function proj(p, uv)
+    local x, y, z = p[1] + ox - c.x, p[2] + oy - c.y, p[3] + oz - c.z
+    local x1 = x * cy - z * sy        -- yaw
+    local z1 = x * sy + z * cy
+    local y2 = y * cp - z1 * sp       -- pitch
+    local z2 = y * sp + z1 * cp
+    if z2 < R.near then return nil end
+    local sx = R.cx + x1 / z2 * R.focal
+    local sy2 = R.cy - y2 / z2 * R.focal
+    if R.snap == 1 then sx, sy2 = flr(sx + 0.5), flr(sy2 + 0.5) end
+    return {x = sx, y = sy2, u = uv[1] * tw, v = uv[2] * th, z = z2}
+  end
+
+  for t in all(mesh) do
+    local a, b, d = proj(t[1], t[4]), proj(t[2], t[5]), proj(t[3], t[6])
+    if a and b and d then   -- (no near clipping: whole triangle is dropped)
+      local area = (b.x-a.x)*(d.y-a.y) - (d.x-a.x)*(b.y-a.y)
+      if area * R.cull > 0 then
+        add(R.list, {a, b, d, z = a.z + b.z + d.z})
+      end
+    end
+  end
+end
+
+-- Rasterise one triangle with a tline3d per scanline (w=1 -> affine).
+local function raster(a, b, c)
+  if a.y > b.y then a, b = b, a end
+  if b.y > c.y then b, c = c, b end
+  if a.y > b.y then a, b = b, a end
+  local function lerp_at(p, q, y)
+    local t = (q.y == p.y) and 0 or (y - p.y) / (q.y - p.y)
+    return p.x + (q.x - p.x) * t, p.u + (q.u - p.u) * t, p.v + (q.v - p.v) * t
+  end
+  for y = ceil(a.y), ceil(c.y) - 1 do
+    local xl, ul, vl = lerp_at(a, c, y)
+    local xr, ur, vr
+    if y < b.y then xr, ur, vr = lerp_at(a, b, y) else xr, ur, vr = lerp_at(b, c, y) end
+    if xl > xr then xl, xr, ul, ur, vl, vr = xr, xl, ur, ul, vr, vl end
+    tline3d(R.tex, xl, y, xr, y, ul, vl, ur, vr, 1, 1)
+  end
+end
+
+-- Far to near, then clear the queue.
+function R.flush()
+  sort(R.list, function(a, b) return a.z > b.z end)
+  for t in all(R.list) do raster(t[1], t[2], t[3]) end
+  R.list = {}
+end
+:: terrain.lua
+--[[pod_format="raw",created="2026-11-25 03:12:09",modified="2026-11-25 03:15:29",revision=1]]
+-- terrain.lua  (port of terrain_generator.gd)
+-- Pure functions of world position.
+
+world_size   = 2048  -- Global.WorldSize.SMALL
+world_height = 64    -- Global.WorldHeights.SMALL
+
+local SEAM = 128
+local CLIMATE_GAIN = 1.6
+local BLEND_SHARPNESS = 12.0
+local CAVE_THRESHOLD = 0.4
+local CAVE_SURFACE_BONUS = 0.35
+local CAVE_SURFACE_FADE = 12.0
+local LAT_WEIGHT = 0.7
+
+-- block indices, copied from Blocks.gd
+local B = {
+  air=0, brick=1, dirt=2, grass=3, grass_dry=4, leaf_conifer=5,
+  leaf_soft=6, log_hardwood=7, log_wood=8, plate=9, stone=10, turf=11
+}
+
+-- Biome .tres files -> a table. PLACEHOLDER VALUES: copy yours from assets/resources/biomes/
+local BIOMES = {
+  {id="plains", temperature=0.0, humidity=0.0, base_height=0.35, amplitude=0.15,
+   surface_block="grass", filler_block="dirt", filler_depth=4},
+}
+table.sort(BIOMES, function(a, b) return a.id < b.id end)
+
+--#region helpers (GDScript built-ins Picotron lacks)
+local function lerp(a, b, t) return a + (b - a) * t end
+local function smoothstep(a, b, x)
+  local t = mid(0, (x - a) / (b - a), 1)
+  return t * t * (3 - 2 * t)
+end
+local function exp(x) return 2.718281828 ^ x end
+--#endregion
+
+--#region noise (replaces FastNoiseLite)
+local function hash(seed, x, y, z)
+  local h = (seed + x * 374761393 + y * 668265263 + z * 1274126177) & 0xffffffff
+  h = ((h ~ (h >> 13)) * 1274126177) & 0xffffffff
+  h = h ~ (h >> 16)
+  return (h & 0xffff) / 32767.5 - 1 -- -1..1
+end
+
+local function fade(t) return t * t * (3 - 2 * t) end
+
+local function noise2(seed, x, y)
+  local xi, yi = flr(x), flr(y)
+  local u, v = fade(x - xi), fade(y - yi)
+  return lerp(lerp(hash(seed,xi,yi,0),   hash(seed,xi+1,yi,0),   u),
+              lerp(hash(seed,xi,yi+1,0), hash(seed,xi+1,yi+1,0), u), v)
+end
+
+local function noise3(seed, x, y, z)
+  local xi, yi, zi = flr(x), flr(y), flr(z)
+  local u, v, w = fade(x - xi), fade(y - yi), fade(z - zi)
+  local function layer(zz)
+    return lerp(lerp(hash(seed,xi,yi,zz),   hash(seed,xi+1,yi,zz),   u),
+                lerp(hash(seed,xi,yi+1,zz), hash(seed,xi+1,yi+1,zz), u), v)
+  end
+  return lerp(layer(zi), layer(zi + 1), w)
+end
+
+-- fractal_octaves / frequency like FastNoiseLite (gain 0.5, lacunarity 2)
+local function make_noise(seed, frequency, octaves)
+  return {seed=seed, freq=frequency, oct=octaves}
+end
+
+local function get2(n, x, y)
+  local sum, amp, f, norm = 0, 1, n.freq, 0
+  for i = 1, n.oct do
+    sum += noise2(n.seed + i, x * f, y * f) * amp
+    norm += amp
+    amp *= 0.5
+    f *= 2
+  end
+  return sum / norm
+end
+
+local function get3(n, x, y, z)
+  local sum, amp, f, norm = 0, 1, n.freq, 0
+  for i = 1, n.oct do
+    sum += noise3(n.seed + i, x * f, y * f, z * f) * amp
+    norm += amp
+    amp *= 0.5
+    f *= 2
+  end
+  return sum / norm
+end
+--#endregion
+
+--#region TerrainGenerator
+TerrainGenerator = {}
+TerrainGenerator.__index = TerrainGenerator
+
+local cache = {} -- seed -> TerrainGenerator
+
+function TerrainGenerator.for_seed(world_seed)
+  if not cache[world_seed] then
+    cache[world_seed] = TerrainGenerator.new(world_seed)
+  end
+  return cache[world_seed]
+end
+
+function TerrainGenerator.new(world_seed)
+  local t = setmetatable({}, TerrainGenerator)
+  t.shape       = make_noise(world_seed,     0.01,  5) -- FastNoiseLite defaults
+  t.temperature = make_noise(world_seed + 1, 0.002, 2)
+  t.humidity    = make_noise(world_seed + 2, 0.002, 2)
+  t.caves       = make_noise(world_seed + 3, 0.04,  2)
+  t.biomes = BIOMES
+  t.air_idx = B.air
+  t.stone_idx = B.stone
+  t.surface_idx, t.filler_idx = {}, {}
+  for i, b in ipairs(BIOMES) do
+    t.surface_idx[i] = B[b.surface_block] or t.stone_idx
+    t.filler_idx[i]  = B[b.filler_block]  or t.stone_idx
+  end
+  -- t.features = FeaturePlacer.new(t, world_seed)  -- once that's ported
+  return t
+end
+
+-- Wrapping: blend with copies shifted by one world width near the far edges
+function TerrainGenerator:wrap2(noise, gx, gz)
+  local n = world_size
+  local x, z = gx % n, gz % n
+  local tx = smoothstep(n - SEAM, n, x)
+  local tz = smoothstep(n - SEAM, n, z)
+  local a = get2(noise, x, z)
+  if tx == 0 and tz == 0 then return a end
+  local b = get2(noise, x - n, z)
+  local c = get2(noise, x, z - n)
+  local d = get2(noise, x - n, z - n)
+  return lerp(lerp(a, b, tx), lerp(c, d, tx), tz)
+end
+
+function TerrainGenerator:wrap3(noise, gx, gy, gz)
+  local n = world_size
+  local x, z = gx % n, gz % n
+  local tx = smoothstep(n - SEAM, n, x)
+  local tz = smoothstep(n - SEAM, n, z)
+  local a = get3(noise, x, gy, z)
+  if tx == 0 and tz == 0 then return a end
+  local b = get3(noise, x - n, gy, z)
+  local c = get3(noise, x, gy, z - n)
+  local d = get3(noise, x - n, gy, z - n)
+  return lerp(lerp(a, b, tx), lerp(c, d, tx), tz)
+end
+
+-- Picotron trig works in turns (0..1 = full circle), so TAU disappears.
+function TerrainGenerator:latitude_climate(gz)
+  local angle = (gz % world_size) / world_size
+  return cos(angle), cos(angle * 3)
+end
+
+-- returns ground height, dominant biome index (1-based)
+function TerrainGenerator:sample_column(gx, gz)
+  local lat_t, lat_h = self:latitude_climate(gz)
+  local t   = mid(-1, lerp(self:wrap2(self.temperature, gx, gz) * CLIMATE_GAIN, lat_t, LAT_WEIGHT), 1)
+  local hum = mid(-1, lerp(self:wrap2(self.humidity,    gx, gz) * CLIMATE_GAIN, lat_h, LAT_WEIGHT), 1)
+
+  local base, amp, total, best, best_w = 0, 0, 0, 1, -1
+  for i, b in ipairs(self.biomes) do
+    local dt, dh = t - b.temperature, hum - b.humidity
+    local w = exp(-(dt * dt + dh * dh) * BLEND_SHARPNESS)
+    base += b.base_height * w
+    amp  += b.amplitude * w
+    total += w
+    if w > best_w then best_w, best = w, i end
+  end
+
+  local height = flr((base / total + self:wrap2(self.shape, gx, gz) * (amp / total)) * world_height)
+  return mid(1, height, world_height - 1), best
+end
+
+-- height/biome are the results of sample_column, so a column samples it once
+function TerrainGenerator:block_at(gx, gy, gz, height, biome)
+  if gy > height then return self.air_idx end
+  local depth = height - gy
+  local threshold = CAVE_THRESHOLD + CAVE_SURFACE_BONUS * (1 - smoothstep(0, CAVE_SURFACE_FADE, depth))
+  if self:wrap3(self.caves, gx, gy, gz) > threshold then return self.air_idx end
+  if gy == height then return self.surface_idx[biome] end
+  if gy >= height - self.biomes[biome].filler_depth then return self.filler_idx[biome] end
+  return self.stone_idx
+end
+
+function TerrainGenerator:is_solid(gx, gy, gz)
+  local h, b = self:sample_column(gx, gz)
+  return self:block_at(gx, gy, gz, h, b) ~= self.air_idx
+end
+--#endregion
+:: .info.pod
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:19:50",runtime=26,workspaces={{location="main.lua#1",workspace_index=1},{location="terrain.lua#156",workspace_index=1},{location="render3d.lua#74",workspace_index=1},{location="block_mesh.lua#10",workspace_index=1},{location="gfx/0.gfx",workspace_index=2},{location="map/0.map",workspace_index=3},{location="sfx/0.sfx",workspace_index=4}}]]
+:: gfx/.info.pod
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:19:50"]]
+:: gfx/0.gfx
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNS0w
+MS0xNyAxMDozNzo0NCIscmV2aXNpb249Ml1dbHo0AH4AAAASMQAA8yF7WzBdPXtibXA9cHh1AEMg
+EBAE8FYHEAfAF9AXwAcQB-BWLGZsYWdzPTAscGFuX3gIAMt5PTAsem9vbT04fSw_AB-wMQD-----
+-----------------------------------------------------------XUG09OH19
+:: map/.info.pod
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:19:50"]]
+:: map/0.map
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNi0x
+MS0yNSAwMjo1NToyOSIscmV2aXNpb249Ml1dbHo0AEwAAABQAAAA8Rx7e2JtcD1weHUATIAgIAD-
+AAD---8DLGhpZGRlbj1mYWxzZSxwYW5feD0wCADSeT0wLHRpbGVfaD0xNgoAEHcKAIB6b29tPTF9
+fQ==
+:: sfx/.info.pod
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:19:50"]]
+:: sfx/0.sfx
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTMxIDA4OjMwOjI4Iixtb2RpZmllZD0iMjAyNS0w
+Ny0zMSAwODozMDoyOCIscmV2aXNpb249MF1dbHo0AKAAAAALCgAA-zBweHUAAygAAAQABA9AEAIO
+AAGgASACoA4ADxAADfDKAQIDQA8PkAQFBgdADJAICQoLQAyQDwwPDQ8ODEAM8P8BAOv-J6oBEAYP
+MBABIAEgAfAAAhACDhABIA8hIAEwD0Dwww8oD--wxg-4Cg--D4AP9w8NAfAJARAGDjAA------_9
+H-8BAKzPyA9AAA8QQP--sPD-AQD-6lD-----KQ==
+:: [eoc]
