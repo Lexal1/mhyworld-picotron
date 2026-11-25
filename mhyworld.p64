@@ -27,21 +27,23 @@ function BlockMesh.add_face(st, face, ox, oy, oz, ax, ay)
   R.st_fan(st, {p(1), p(3), p(4)}, {a, c, d})
 end
 :: main.lua
---[[pod_format="raw",created="2026-11-25 03:15:49",modified="2026-11-25 03:24:14",revision=2]]
+--[[pod_format="raw",created="2026-11-25 03:15:49",modified="2026-11-25 03:27:44",revision=3]]
 -- main.lua
-include("terrain.lua") -- terrain.lua must set TerrainGenerator as a global (see note)
+include("terrain.lua")
+include("render3d.lua")
+include("block_mesh.lua")
 
 local SX, SY, SZ = 16, 16, 16      -- Global.CHUNK_SIZE
-local SEED = 128                   -- fixed, so results are repeatable while testing
+local SEED = 128
+ATLAS_W, ATLAS_H = 1, 1            -- Global.TEXTURE_ATLAS_SIZE (placeholder: gfx/0.gfx is one tile)
 local terrain
-local blocks = {}
-local cx, cy, cz = 0, 0, 0         -- chunk position
+local blocks, mesh = {}, {}
+local cx, cy, cz = 0, 0, 0
 local gen_time = 0
 
--- same layout as Chunk.block_index, +1 because Lua arrays start at 1
 local function block_index(x, y, z) return (y * SZ + z) * SX + x + 1 end
 
--- port of Chunk._generate (without the mutex/threads/features)
+-- port of Chunk._generate
 local function generate()
   local t0 = time()
   local ox, oy, oz = cx * SX, cy * SY, cz * SZ
@@ -57,49 +59,84 @@ local function generate()
   gen_time = (time() - t0) * 1000
 end
 
-function _init()
-  terrain = TerrainGenerator.for_seed(SEED)
-  -- start on the chunk holding the surface at (0, 0), like Chunk._ready does in the editor
-  cy = terrain:sample_column(0, 0) \ SY
-  generate()
+-- port of Chunk._is_transparent (outside the chunk: ask the noise, like the fallback)
+local function is_transparent(x, y, z)
+  if x < 0 or x >= SX or y < 0 or y >= SY or z < 0 or z >= SZ then
+    return not terrain:is_solid(cx * SX + x, cy * SY + y, cz * SZ + z)
+  end
+  return blocks[block_index(x, y, z)] == 0
 end
 
-function _update()
-  local moved = false
-  if btnp(0) then cx -= 1 moved = true end
-  if btnp(1) then cx += 1 moved = true end
-  if btnp(2) then cz -= 1 moved = true end
-  if btnp(3) then cz += 1 moved = true end
-  if btnp(4) then cy -= 1 moved = true end -- Z
-  if btnp(5) then cy += 1 moved = true end -- X
-  if moved then generate() end
-end
+-- face, neighbour direction (same order as Chunk._create_block)
+local FACES = {
+  {BlockMesh.TOP,    0, 1, 0}, {BlockMesh.BOTTOM, 0,-1, 0},
+  {BlockMesh.NORTH,  0, 0, 1}, {BlockMesh.SOUTH,  0, 0,-1},
+  {BlockMesh.EAST,   1, 0, 0}, {BlockMesh.WEST,  -1, 0, 0},
+}
 
--- block idx -> colour (0 = air is skipped)
-local COLORS = {[2]=4, [3]=11, [10]=5}
-
-function _draw()
-  cls(0)
-  local px, py, s = 20, 30, 8
-  -- top-down view: first solid block from the top of each column
-  for x = 0, SX - 1 do
+-- port of Chunk._update_mesh / _create_block
+local function build_mesh()
+  local st = R.st_begin()
+  for y = 0, SY - 1 do
     for z = 0, SZ - 1 do
-      for y = SY - 1, 0, -1 do
-        local b = blocks[block_index(x, y, z)]
-        if b ~= 0 then
-          rectfill(px + x * s, py + z * s, px + x * s + s - 1, py + z * s + s - 1, COLORS[b] or 6)
-          break
+      for x = 0, SX - 1 do
+        if blocks[block_index(x, y, z)] ~= 0 then
+          for f in all(FACES) do
+            if is_transparent(x + f[2], y + f[3], z + f[4]) then
+              BlockMesh.add_face(st, f[1], x, y, z, 0, 0) -- atlas tile (0,0) for every block for now
+            end
+          end
         end
       end
     end
   end
+  mesh = st
+end
+
+local yaw, pitch, dist = 0, 0.15, 30
+
+function _init()
+  R.tex = get_spr(0)
+  terrain = TerrainGenerator.for_seed(SEED)
+  cy = terrain:sample_column(0, 0) \ SY
+  generate() build_mesh()
+end
+
+function _update()
+  local moved = false
+  if keyp("a") then cx -= 1 moved = true end
+  if keyp("d") then cx += 1 moved = true end
+  if keyp("w") then cz -= 1 moved = true end
+  if keyp("s") then cz += 1 moved = true end
+  if btnp(4) then cy -= 1 moved = true end -- Z
+  if btnp(5) then cy += 1 moved = true end -- X
+  if moved then generate() build_mesh() end
+
+  if btn(0) then yaw -= 0.01 end
+  if btn(1) then yaw += 0.01 end
+  if btn(2) then pitch = mid(-0.24, pitch + 0.01, 0.24) end
+  if btn(3) then pitch = mid(-0.24, pitch - 0.01, 0.24) end
+end
+
+function _draw()
+  cls(12)
+  -- orbit camera around the chunk centre, looking at it
+  local cyw, syw, cp, sp = cos(yaw), sin(yaw), cos(pitch), sin(pitch)
+  local c = R.cam
+  c.x = 8 - dist * cp * syw
+  c.y = 8 - dist * sp
+  c.z = 8 - dist * cp * cyw
+  c.yaw, c.pitch = yaw, pitch
+
+  R.draw_mesh(mesh, cx * SX, cy * SY, cz * SZ)
+  R.flush()
 
   print("fps: " .. stat(7), 2, 2, 7)
-  print(string.format("chunk %d,%d,%d  gen %.1f ms", cx, cy, cz, gen_time), 2, 12, 7)
-  print("arrows: x/z   z/x keys: y", 2, 260, 6)
+  print(string.format("chunk %d,%d,%d  gen %.1f ms  tris %d", cx, cy, cz, gen_time, #mesh), 2, 12, 7)
+  print("arrows: orbit  wasd: x/z  z/x: y", 2, 260, 6)
 end
 :: render3d.lua
---[[pod_format="raw",created="2026-11-25 03:19:31",modified="2026-11-25 03:19:31",revision=0]]
+--[[pod_format="raw",created="2026-11-25 03:19:31",modified="2026-11-25 03:46:09",revision=1]]
 -- render3d.lua : minimal PSX-style software renderer for Picotron
 -- Affine textures (like models.gdshader with affine_weight=1), vertex snapping, painter's sort.
 
@@ -108,7 +145,7 @@ R = {
   focal = 200,             -- pixels; bigger = narrower fov
   near = 0.1,
   snap = 1,                -- 1 = snap to whole pixels (PSX wobble), 0 = off
-  cull = 1,                -- flip to -1 if everything vanishes
+  cull = -1,                -- flip to -1 if everything vanishes
   cam = {x=0, y=0, z=0, yaw=0, pitch=0},
   tex = nil,               -- atlas userdata
   list = {},               -- triangles queued this frame
@@ -184,7 +221,7 @@ function R.flush()
   R.list = {}
 end
 :: terrain.lua
---[[pod_format="raw",created="2026-11-25 03:12:09",modified="2026-11-25 03:15:29",revision=1]]
+--[[pod_format="raw",created="2026-11-25 03:12:09",modified="2026-11-25 03:45:09",revision=5]]
 -- terrain.lua  (port of terrain_generator.gd)
 -- Pure functions of world position.
 
@@ -199,6 +236,27 @@ local CAVE_SURFACE_BONUS = 0.35
 local CAVE_SURFACE_FADE = 12.0
 local LAT_WEIGHT = 0.7
 
+--#region helpers (GDScript built-ins Picotron lacks)
+local function lerp(a, b, t) return a + (b - a) * t end
+local function smoothstep(a, b, x)
+  local t = mid(0, (x - a) / (b - a), 1)
+  return t * t * (3 - 2 * t)
+end
+local function exp(x) return 2.718281828 ^ x end
+
+-- Picotron has no sort: simple insertion sort (fine for a few biomes)
+function sort(t, cmp)
+  for i = 2, #t do
+    local v, j = t[i], i - 1
+    while j >= 1 and cmp(v, t[j]) do
+      t[j + 1] = t[j]
+      j -= 1
+    end
+    t[j + 1] = v
+  end
+end
+--#endregion
+
 -- block indices, copied from Blocks.gd
 local B = {
   air=0, brick=1, dirt=2, grass=3, grass_dry=4, leaf_conifer=5,
@@ -207,19 +265,16 @@ local B = {
 
 -- Biome .tres files -> a table. PLACEHOLDER VALUES: copy yours from assets/resources/biomes/
 local BIOMES = {
-  {id="plains", temperature=0.0, humidity=0.0, base_height=0.35, amplitude=0.15,
+  {id="plains", temperature=0.5, humidity=0.5, base_height=0.35, amplitude=0.06,
    surface_block="grass", filler_block="dirt", filler_depth=4},
+  {id="dry_plains", temperature=0.45, humidity=0.0, base_height=0.35, amplitude=0.15,
+   surface_block="grass_dry", filler_block="dirt", filler_depth=3},
+  {id="hills", temperature=0.2, humidity=0.4, base_height=0.35, amplitude=0.25,
+   surface_block="grass", filler_block="dirt", filler_depth=3},
+  {id="mountains", temperature=0.0, humidity=0.1, base_height=0.75, amplitude=0.5,
+   surface_block="stone", filler_block="dirt", filler_depth=1}
 }
-table.sort(BIOMES, function(a, b) return a.id < b.id end)
-
---#region helpers (GDScript built-ins Picotron lacks)
-local function lerp(a, b, t) return a + (b - a) * t end
-local function smoothstep(a, b, x)
-  local t = mid(0, (x - a) / (b - a), 1)
-  return t * t * (3 - 2 * t)
-end
-local function exp(x) return 2.718281828 ^ x end
---#endregion
+sort(BIOMES, function(a, b) return a.id < b.id end)
 
 --#region noise (replaces FastNoiseLite)
 local function hash(seed, x, y, z)
@@ -377,23 +432,25 @@ function TerrainGenerator:is_solid(gx, gy, gz)
 end
 --#endregion
 :: .info.pod
---[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:24:14",runtime=26,workspaces={{location="main.lua#51",workspace_index=1},{location="terrain.lua#156",workspace_index=1},{location="render3d.lua#74",workspace_index=1},{location="block_mesh.lua#10",workspace_index=1},{location="gfx/0.gfx",workspace_index=2},{location="map/0.map",workspace_index=3},{location="sfx/0.sfx",workspace_index=4}}]]
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:46:09",runtime=26,workspaces={{location="main.lua#96",workspace_index=1},{location="terrain.lua#34",workspace_index=1},{location="render3d.lua#9",workspace_index=1},{location="block_mesh.lua#10",workspace_index=1},{location="gfx/0.gfx#1",workspace_index=2},{location="map/0.map",workspace_index=3},{location="sfx/0.sfx",workspace_index=4}}]]
 :: gfx/.info.pod
---[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:24:14"]]
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:46:09"]]
 :: gfx/0.gfx
-b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNS0w
-MS0xNyAxMDozNzo0NCIscmV2aXNpb249Ml1dbHo0AH4AAAASMQAA8yF7WzBdPXtibXA9cHh1AEMg
-EBAE8FYHEAfAF9AXwAcQB-BWLGZsYWdzPTAscGFuX3gIAMt5PTAsem9vbT04fSw_AB-wMQD-----
------------------------------------------------------------XUG09OH19
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNi0x
+MS0yNSAwMzozMDowMyIscmV2aXNpb249NF1dbHo0AL8AAABnMQAA_Ah7WzBdPXtibXA9cHh1AEMg
+EBAEfx5wfgIASfAAfnACAOMsZmxhZ3M9MCxwYW5feAgAz3k9MCx6b29tPTh9LFAAAPADLiAecB4Q
+PnAeAE5wDkAecA4AAgABCADwAiAO8AIOAB4AHqAeAB6ATgAOBADvkD4ADnAOEC4ADnAeQA50AB4v
+8PAxAP---------------------------------------------------------------6ZQbT04
+fX0=
 :: map/.info.pod
---[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:24:14"]]
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:46:09"]]
 :: map/0.map
 b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTAxLTE3IDEwOjM1OjQ4Iixtb2RpZmllZD0iMjAyNi0x
 MS0yNSAwMjo1NToyOSIscmV2aXNpb249Ml1dbHo0AEwAAABQAAAA8Rx7e2JtcD1weHUATIAgIAD-
 AAD---8DLGhpZGRlbj1mYWxzZSxwYW5feD0wCADSeT0wLHRpbGVfaD0xNgoAEHcKAIB6b29tPTF9
 fQ==
 :: sfx/.info.pod
---[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:24:14"]]
+--[[pod,created="2026-04-16 19:10:37",modified="2026-11-25 03:46:09"]]
 :: sfx/0.sfx
 b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTMxIDA4OjMwOjI4Iixtb2RpZmllZD0iMjAyNS0w
 Ny0zMSAwODozMDoyOCIscmV2aXNpb249MF1dbHo0AKAAAAALCgAA-zBweHUAAygAAAQABA9AEAIO
